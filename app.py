@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 PORT = 8203
 ROLES = {"viewer", "hospital", "coordinator", "allocation_officer", "auditor"}
-STATUSES = {"proposed", "accepted", "in_transit", "handed_off", "implanted", "withdrawn", "expired"}
+STATUSES = {"proposed", "accepted", "in_transit", "handed_off", "implanted", "withdrawn", "expired", "rejected"}
 
 
 class ApiError(Exception):
@@ -58,7 +58,7 @@ class Repository:
             created_by TEXT NOT NULL, created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS allocations(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, donor_id INTEGER NOT NULL UNIQUE REFERENCES donors(id), candidate_id INTEGER NOT NULL REFERENCES candidates(id),
+            id INTEGER PRIMARY KEY AUTOINCREMENT, donor_id INTEGER NOT NULL REFERENCES donors(id), candidate_id INTEGER NOT NULL REFERENCES candidates(id),
             score REAL NOT NULL, status TEXT NOT NULL DEFAULT 'proposed', revision INTEGER NOT NULL DEFAULT 1,
             cold_chain_temp REAL, delayed_minutes INTEGER NOT NULL DEFAULT 0, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL, accepted_at TEXT, implanted_at TEXT
@@ -69,11 +69,38 @@ class Repository:
             initiated_by TEXT NOT NULL, accepted_by TEXT, initiated_at TEXT NOT NULL, accepted_at TEXT,
             UNIQUE(allocation_id)
         );
+        CREATE TABLE IF NOT EXISTS reassignments(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, donor_id INTEGER NOT NULL REFERENCES donors(id),
+            from_allocation_id INTEGER NOT NULL REFERENCES allocations(id), from_hospital TEXT NOT NULL,
+            reason TEXT NOT NULL, rejected_by TEXT NOT NULL, rejected_at TEXT NOT NULL,
+            to_allocation_id INTEGER REFERENCES allocations(id), to_hospital TEXT, reassigned_by TEXT, reassigned_at TEXT
+        );
         CREATE TABLE IF NOT EXISTS audit_log(
             id INTEGER PRIMARY KEY AUTOINCREMENT, allocation_id INTEGER, donor_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL,
             action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL
         );
         """)
+        self._drop_allocation_donor_unique()
+
+    def _drop_allocation_donor_unique(self) -> None:
+        """旧库 allocations.donor_id 带 UNIQUE，拒收改派后同一器官需保留多张历史单，重建表去掉约束。"""
+        row = self.conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='allocations'").fetchone()
+        if not row or "UNIQUE" not in row["sql"].upper(): return
+        self.conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            with self.tx() as conn:
+                conn.execute("""CREATE TABLE allocations_migrated(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, donor_id INTEGER NOT NULL REFERENCES donors(id), candidate_id INTEGER NOT NULL REFERENCES candidates(id),
+                    score REAL NOT NULL, status TEXT NOT NULL DEFAULT 'proposed', revision INTEGER NOT NULL DEFAULT 1,
+                    cold_chain_temp REAL, delayed_minutes INTEGER NOT NULL DEFAULT 0, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL, accepted_at TEXT, implanted_at TEXT
+                )""")
+                conn.execute("""INSERT INTO allocations_migrated(id,donor_id,candidate_id,score,status,revision,cold_chain_temp,delayed_minutes,created_by,created_at,updated_at,accepted_at,implanted_at)
+                                SELECT id,donor_id,candidate_id,score,status,revision,cold_chain_temp,delayed_minutes,created_by,created_at,updated_at,accepted_at,implanted_at FROM allocations""")
+                conn.execute("DROP TABLE allocations")
+                conn.execute("ALTER TABLE allocations_migrated RENAME TO allocations")
+        finally:
+            self.conn.execute("PRAGMA foreign_keys=ON")
 
     @contextmanager
     def tx(self):
@@ -87,6 +114,37 @@ class Repository:
     def audit(conn: sqlite3.Connection, allocation_id: int | None, donor_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
         conn.execute("INSERT INTO audit_log(allocation_id,donor_id,actor,role,action,detail_json,created_at) VALUES(?,?,?,?,?,?,?)",
                      (allocation_id, donor_id, actor, role, action, json.dumps(detail, ensure_ascii=False, sort_keys=True), iso()))
+
+
+class ReassignmentLedger:
+    """改派记录台账：拒收与新去向独立存档，按时间排列，只增不删。"""
+
+    @staticmethod
+    def record_rejection(conn: sqlite3.Connection, donor_id: int, allocation_id: int, from_hospital: str, reason: str, actor: str) -> dict[str, Any]:
+        cur = conn.execute("""INSERT INTO reassignments(donor_id,from_allocation_id,from_hospital,reason,rejected_by,rejected_at)
+                              VALUES(?,?,?,?,?,?)""", (donor_id, allocation_id, from_hospital, reason, actor, iso()))
+        return dict(conn.execute("SELECT * FROM reassignments WHERE id=?", (cur.lastrowid,)).fetchone())
+
+    @staticmethod
+    def open_for_donor(conn: sqlite3.Connection, donor_id: int) -> sqlite3.Row | None:
+        return conn.execute("SELECT * FROM reassignments WHERE donor_id=? AND to_allocation_id IS NULL ORDER BY id DESC LIMIT 1", (donor_id,)).fetchone()
+
+    @staticmethod
+    def link_destination(conn: sqlite3.Connection, record_id: int, allocation_id: int, to_hospital: str, actor: str) -> None:
+        conn.execute("UPDATE reassignments SET to_allocation_id=?,to_hospital=?,reassigned_by=?,reassigned_at=? WHERE id=?",
+                     (allocation_id, to_hospital, actor, iso(), record_id))
+
+    @staticmethod
+    def rejected_hospitals(conn: sqlite3.Connection, donor_id: int) -> set[str]:
+        return {row["from_hospital"] for row in conn.execute("SELECT DISTINCT from_hospital FROM reassignments WHERE donor_id=?", (donor_id,))}
+
+    @staticmethod
+    def history(conn: sqlite3.Connection, donor_id: int | None = None) -> list[dict[str, Any]]:
+        if donor_id is None:
+            rows = conn.execute("SELECT * FROM reassignments ORDER BY rejected_at,id")
+        else:
+            rows = conn.execute("SELECT * FROM reassignments WHERE donor_id=? ORDER BY rejected_at,id", (donor_id,))
+        return [dict(row) for row in rows]
 
 
 class OrganAllocationService:
@@ -143,8 +201,10 @@ class OrganAllocationService:
         with self.repo.tx() as conn:
             donor = conn.execute("SELECT * FROM donors WHERE id=?", (donor_id,)).fetchone()
             if not donor: raise ApiError(404, "donor_not_found", "器官不存在")
+            excluded = ReassignmentLedger.rejected_hospitals(conn, donor_id)
             rows = []
             for candidate in conn.execute("SELECT * FROM candidates WHERE organ=? AND status='active' AND willing=1", (donor["organ"],)):
+                if candidate["hospital"] in excluded: continue
                 if blood_compatible(donor["blood_type"], candidate["blood_type"]):
                     item = dict(candidate); item["match"] = self._score(donor, candidate); rows.append(item)
             rows.sort(key=lambda item: (-item["match"]["total"], item["id"]))
@@ -166,14 +226,22 @@ class OrganAllocationService:
             if candidate["status"] != "active" or not candidate["willing"]: raise ApiError(409, "candidate_unavailable", "候选患者当前不可接受分配")
             if donor["organ"] != candidate["organ"] or not blood_compatible(donor["blood_type"], candidate["blood_type"]):
                 raise ApiError(409, "medical_mismatch", "器官类型或血型不匹配")
-            if conn.execute("SELECT 1 FROM allocations WHERE donor_id=? AND status NOT IN ('withdrawn','expired')", (donor_id,)).fetchone():
+            if conn.execute("SELECT 1 FROM allocations WHERE donor_id=? AND status NOT IN ('withdrawn','expired','rejected')", (donor_id,)).fetchone():
                 raise ApiError(409, "already_allocated", "该器官已有有效分配")
+            if candidate["hospital"] in ReassignmentLedger.rejected_hospitals(conn, donor_id):
+                raise ApiError(409, "hospital_rejected", "该医院已拒收过此器官，不能再次分配")
             score = self._score(donor, candidate)
             cur = conn.execute("""INSERT INTO allocations(donor_id,candidate_id,score,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?)""",
                                (donor_id, candidate_id, score["total"], actor, iso(), iso()))
             allocation_id = cur.lastrowid
             conn.execute("UPDATE donors SET status='allocated',revision=revision+1 WHERE id=?", (donor_id,))
             Repository.audit(conn, allocation_id, donor_id, actor, role, "allocation_proposed", {"candidate_id": candidate_id, "score": score})
+            open_record = ReassignmentLedger.open_for_donor(conn, donor_id)
+            if open_record:
+                ReassignmentLedger.link_destination(conn, open_record["id"], allocation_id, candidate["hospital"], actor)
+                Repository.audit(conn, allocation_id, donor_id, actor, role, "reassignment_completed",
+                                 {"from_allocation_id": open_record["from_allocation_id"], "from_hospital": open_record["from_hospital"],
+                                  "to_hospital": candidate["hospital"], "reason": open_record["reason"]})
             return self._allocation(conn, allocation_id, role, "")
 
     def _allocation(self, conn: sqlite3.Connection, allocation_id: int, role: str, hospital: str) -> dict[str, Any]:
@@ -187,12 +255,14 @@ class OrganAllocationService:
         if role == "hospital" and hospital != row["candidate_hospital"]:
             result["patient_name"] = "***"
         result["handoff"] = self._row(conn.execute("SELECT * FROM handoffs WHERE allocation_id=?", (allocation_id,)).fetchone())
+        result["reassignments"] = [dict(r) for r in conn.execute(
+            "SELECT * FROM reassignments WHERE from_allocation_id=? OR to_allocation_id=? ORDER BY id", (allocation_id, allocation_id))]
         return result
 
     def _ensure_active(self, conn: sqlite3.Connection, allocation_id: int, actor: str, role: str) -> sqlite3.Row:
         row = conn.execute("SELECT * FROM allocations WHERE id=?", (allocation_id,)).fetchone()
         if not row: raise ApiError(404, "allocation_not_found", "分配不存在")
-        if row["status"] in {"withdrawn", "expired", "implanted"}: raise ApiError(409, "allocation_closed", "分配已结束")
+        if row["status"] in {"withdrawn", "expired", "implanted", "rejected"}: raise ApiError(409, "allocation_closed", "分配已结束")
         donor = conn.execute("SELECT * FROM donors WHERE id=?", (row["donor_id"],)).fetchone()
         if parse_time(donor["expires_at"]) <= utcnow():
             conn.execute("UPDATE allocations SET status='expired',revision=revision+1,updated_at=? WHERE id=?", (iso(), allocation_id))
@@ -298,6 +368,36 @@ class OrganAllocationService:
             Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "allocation_withdrawn", {"reason": reason})
             return self._allocation(conn, allocation_id, role, hospital)
 
+    def reject(self, allocation_id: int, actor: str, role: str, hospital: str, body: dict[str, Any]) -> dict[str, Any]:
+        """拒收判定：转运中接收医院写明原因后，原分配标记已拒收，器官未过期即回到可分配。"""
+        if role != "hospital": raise ApiError(403, "reject_forbidden", "只有接收医院可以拒收")
+        reason = str(body.get("reason", "")).strip()
+        if not reason: raise ApiError(400, "reason_required", "拒收原因必填，写明后才能建立新去向")
+        with self.repo.tx() as conn:
+            row = self._ensure_active(conn, allocation_id, actor, role)
+            candidate = conn.execute("SELECT * FROM candidates WHERE id=?", (row["candidate_id"],)).fetchone()
+            if hospital != candidate["hospital"]: raise ApiError(403, "wrong_hospital", "只能由接收医院拒收")
+            if row["status"] != "in_transit": raise ApiError(409, "invalid_transition", "只有转运中的分配可以拒收")
+            conn.execute("UPDATE allocations SET status='rejected',revision=revision+1,updated_at=? WHERE id=?", (iso(), allocation_id))
+            donor = conn.execute("SELECT * FROM donors WHERE id=?", (row["donor_id"],)).fetchone()
+            donor_status = "available" if parse_time(donor["expires_at"]) > utcnow() else "expired"
+            conn.execute("UPDATE donors SET status=?,revision=revision+1 WHERE id=?", (donor_status, row["donor_id"]))
+            record = ReassignmentLedger.record_rejection(conn, row["donor_id"], allocation_id, hospital, reason, actor)
+            Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "allocation_rejected",
+                             {"reason": reason, "hospital": hospital, "reassignment_id": record["id"]})
+            return self._allocation(conn, allocation_id, role, hospital)
+
+    def reassignments(self, donor_id: int, role: str, hospital: str) -> dict[str, Any]:
+        conn = self.repo.conn
+        if not conn.execute("SELECT 1 FROM donors WHERE id=?", (donor_id,)).fetchone():
+            raise ApiError(404, "donor_not_found", "器官不存在")
+        records = ReassignmentLedger.history(conn, donor_id)
+        if role == "hospital":
+            records = [r for r in records if hospital in {r["from_hospital"], r["to_hospital"]}]
+        elif role not in {"coordinator", "allocation_officer", "auditor"}:
+            raise ApiError(403, "reassignment_forbidden", "当前角色不能查看改派记录")
+        return {"donor_id": donor_id, "reassignments": records}
+
     def get_allocation(self, allocation_id: int, role: str, hospital: str) -> dict[str, Any]:
         return self._allocation(self.repo.conn, allocation_id, role, hospital)
 
@@ -311,15 +411,18 @@ class OrganAllocationService:
             donors = [dict(r) for r in conn.execute("SELECT * FROM donors WHERE hospital=?", (hospital,))]
             candidates = [dict(r) for r in conn.execute("SELECT * FROM candidates WHERE hospital=?", (hospital,))]
             allocated = [dict(r) for r in conn.execute("SELECT a.* FROM allocations a JOIN candidates c ON c.id=a.candidate_id WHERE c.hospital=?", (hospital,))]
+            reassignments = [r for r in ReassignmentLedger.history(conn) if hospital in {r["from_hospital"], r["to_hospital"]}]
         elif role == "viewer":
             donors = []
             candidates = []
             allocated = [dict(r) for r in conn.execute("SELECT id,status,updated_at FROM allocations WHERE status='implanted' ORDER BY id DESC")]
+            reassignments = []
         else:
             donors = [dict(r) for r in conn.execute("SELECT * FROM donors ORDER BY id DESC")]
             candidates = [dict(r) for r in conn.execute("SELECT * FROM candidates ORDER BY id DESC")]
             allocated = [dict(r) for r in conn.execute("SELECT * FROM allocations ORDER BY id DESC")]
-        return {"donors": donors, "candidates": candidates, "allocations": allocated, "server_time": iso()}
+            reassignments = ReassignmentLedger.history(conn)
+        return {"donors": donors, "candidates": candidates, "allocations": allocated, "reassignments": reassignments, "server_time": iso()}
 
 
 def json_reply(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
@@ -342,6 +445,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state": return 200, self.service.state(role, hospital)
         parts = [p for p in path.split("/") if p]
         if len(parts) == 4 and parts[:2] == ["api", "donors"] and parts[2].isdigit() and parts[3] == "ranking": return 200, self.service.ranking(int(parts[2]), role, hospital)
+        if len(parts) == 4 and parts[:2] == ["api", "donors"] and parts[2].isdigit() and parts[3] == "reassignments": return 200, self.service.reassignments(int(parts[2]), role, hospital)
         if len(parts) == 3 and parts[:2] == ["api", "allocations"] and parts[2].isdigit(): return 200, self.service.get_allocation(int(parts[2]), role, hospital)
         if len(parts) == 4 and parts[:2] == ["api", "allocations"] and parts[2].isdigit() and parts[3] == "audit": return 200, {"audit": self.service.audit(int(parts[2]), role)}
         raise ApiError(404, "not_found", "接口不存在")
@@ -358,6 +462,7 @@ class Handler(BaseHTTPRequestHandler):
             routes = {
                 "accept": lambda: self.service.accept(aid, actor, role, hospital, body),
                 "withdraw": lambda: self.service.withdraw(aid, actor, role, hospital, body),
+                "reject": lambda: self.service.reject(aid, actor, role, hospital, body),
                 "transit": lambda: self.service.mark_transit(aid, actor, role, body),
                 "delay": lambda: self.service.report_delay(aid, actor, role, body),
                 "handoff": lambda: self.service.initiate_handoff(aid, actor, role, hospital, body),

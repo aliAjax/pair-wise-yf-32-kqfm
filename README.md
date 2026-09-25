@@ -16,9 +16,11 @@ python3 app.py --db organ_allocation.db
 
 - `POST /api/donors`、`POST /api/candidates`：登记器官与候选患者。
 - `GET /api/donors/{id}/ranking`：查看兼容候选排序。
-- `POST /api/allocations`：提出唯一分配。
+- `POST /api/allocations`：提出唯一分配；器官有未结改派时自动回填新去向，已拒收过该器官的医院不能再次分配。
 - `POST /api/allocations/{id}/accept`、`withdraw`：医院确认或撤回。
 - `POST /api/allocations/{id}/transit`、`delay`：冷链转运和延误上报。
+- `POST /api/allocations/{id}/reject`：转运中接收医院写明原因拒收，原单标记已拒收，器官未过期即回到可分配；候选排序不再出现已拒收医院。
+- `GET /api/donors/{id}/reassignments`：按时间查看改派时间线（原医院、原因、新医院、操作人），旧分配与审计记录保留。
 - `POST /api/allocations/{id}/handoff`、`handoff-accept`：来源医院发起、接收医院确认。
 - `POST /api/allocations/{id}/implant`：确认植入。
 - `GET /api/allocations/{id}/audit`、`GET /api/state`：完整审计和权限视图。
