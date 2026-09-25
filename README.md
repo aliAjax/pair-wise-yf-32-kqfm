@@ -20,6 +20,9 @@ python3 app.py --db organ_allocation.db
 - `POST /api/allocations/{id}/accept`、`withdraw`：医院确认或撤回。
 - `POST /api/allocations/{id}/transit`、`delay`：冷链转运和延误上报。
 - `POST /api/allocations/{id}/handoff`、`handoff-accept`：来源医院发起、接收医院确认。
+- `POST /api/allocations/{id}/reject`：转运中接收医院拒收，原因必填，原单标记为已拒收；器官未过期则退回可重分配。
+- `POST /api/allocations/{id}/reassign`：分配员对已拒收分配发起改派，从候选排序（已排除拒收医院）选择新去向，生成新分配单。
+- `GET /api/reassignments`：协调台改派记录，按时间展示原医院、原因、新医院和操作人（可加 `?donor_id=` 过滤）。
 - `POST /api/allocations/{id}/implant`：确认植入。
 - `GET /api/allocations/{id}/audit`、`GET /api/state`：完整审计和权限视图。
 
